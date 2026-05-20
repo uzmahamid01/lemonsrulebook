@@ -1,0 +1,13 @@
+[project]
+name = "lemonsrulebook"
+version = "0.1.0"
+description = "Virtual inspector for the 24 Hours of Lemons rulebook — citation-faithful RAG with visual rule surfacing."
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.102.0",
+    "chromadb>=1.5.9",
+    "pymupdf>=1.27.2.3",
+    "python-dotenv>=1.2.2",
+    "streamlit>=1.57.0",
+    "voyageai>=0.3.7",
+]
