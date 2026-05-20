@@ -73,11 +73,13 @@ def _render_extras(a: Answer) -> None:
             label_text = (
                 informative[0] if informative else (lines[0] if lines else "")
             )[:60]
-            caption = f"{img['doc']} p.{img['page']} — {label_text}  (dist {img['distance']:.2f})"
+            # Citation format: Doc p.Page — description (similarity score)
+            citation = f"**{img['doc']} p.{img['page']}**"
+            caption = f"{citation} — {label_text}\n*(match: {img['distance']:.2f})*"
             cols[i % n_cols].image(str(full), caption=caption, use_container_width=True)
 
     if a.invalid_citations:
-        bad = ", ".join(f"Rule {c}" for c in a.invalid_citations)
+        bad = ", ".join(c for c in a.invalid_citations)
         st.error(f"⚠ Unverified citation(s): {bad} — not found in the corpus.")
     elif a.cited_rules:
         n = len(a.cited_rules)
@@ -162,9 +164,13 @@ with st.sidebar:
     st.subheader("About")
     st.markdown(
         "This is a proof-of-concept built for the GovStream.ai coding challenge.\n\n"
-        "**Pipeline:** Voyage AI embedding → Chroma top-6 → "
-        "Claude Sonnet 4.6 with strict citation prompt → post-hoc citation validator.\n\n"
-        "**Corpus:** Rulebook, How Not To Fail Tech, Safety Checklist, Tech Sheet."
+        "**Pipeline:**\n"
+        "- Text: Voyage AI `voyage-4-large` → Chroma top-6 rules\n"
+        "- Images: Voyage multimodal-3 → Chroma embeddings for image and image captions\n"
+        "- Generate: Claude Sonnet 4.6 (temp=0, strict citation format)\n"
+        "- Validate: Post-hoc citation checker (Rule X.Y, Doc p.N, etc.)\n\n"
+        "**Corpus:** Rulebook (164 rules), How Not To Fail Tech (35 figures), "
+        "Safety Checklist, Tech Sheet."
     )
     st.markdown("**Try these:**")
     for ex in [

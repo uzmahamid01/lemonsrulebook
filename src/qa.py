@@ -67,8 +67,12 @@ RULES FOR YOUR ANSWER:
    the image should show and where it is located (e.g., "Image from Safety Checklist p.3").
 """
 
-# Captures parenthesized OR bare "Rule X.Y(.Z)" citations.
-RULE_CITATION_RE = re.compile(r"Rule\s+(\d+(?:\.\d+){1,3})")
+# Captures all citation formats: Rule X.Y(.Z), Safety Checklist p.N, How Not To Fail Tech p.N, Tech Sheet
+RULE_CITATION_RE = re.compile(
+    r"(?:Rule\s+(\d+(?:\.\d+){1,3})|"
+    r"(Safety Checklist|How Not To Fail Tech|Tech Sheet)\s+p\.(\d+)|"
+    r"(Tech Sheet))"
+)
 
 
 @dataclass
@@ -187,9 +191,25 @@ def _build_user_prompt(question: str, retrieved: list[Retrieved]) -> str:
 
 
 def _validate(answer_text: str, valid: set[str]) -> tuple[list[str], list[str]]:
-    """Extract cited rules from the answer and flag any that don't exist in the corpus."""
-    cited = list(dict.fromkeys(RULE_CITATION_RE.findall(answer_text)))  # dedup, keep order
-    invalid = [c for c in cited if c not in valid]
+    """Extract all citations (Rule X.Y, Safety Checklist p.N, etc.) and validate against corpus."""
+    matches = RULE_CITATION_RE.findall(answer_text)
+    cited = []
+    invalid = []
+    for match in matches:
+        if match[0]:  # Rule X.Y.Z
+            rule_num = match[0]
+            citation = f"Rule {rule_num}"
+            if rule_num not in valid:
+                invalid.append(citation)
+        elif match[1]:  # Safety Checklist p.N or How Not To Fail Tech p.N
+            citation = f"{match[1]} p.{match[2]}"
+        elif match[3]:  # Tech Sheet
+            citation = "Tech Sheet"
+        else:
+            continue
+        if citation not in cited:
+            cited.append(citation)
+
     return cited, invalid
 
 

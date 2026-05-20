@@ -220,7 +220,13 @@ def build_image_index(reset: bool = True):
 
     ids = [m["path"] for m in images]
     metas = [
-        {"path": m["path"], "doc": m["doc"], "page": m["page"], "caption": m["caption"]}
+        {
+            "path": m["path"],
+            "doc": m["doc"],
+            "page": m["page"],
+            "caption": m["caption"],
+            "doc_file": m.get("doc_file", ""),  # filename for context
+        }
         for m in images
     ]
     docs = [m["caption"] or m["path"] for m in images]  # what Chroma stores as the "document"
