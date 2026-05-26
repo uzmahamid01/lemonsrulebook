@@ -7,16 +7,21 @@ plus related figures from the rulebook. Uses Streamlit's session state to track 
 
 from __future__ import annotations
 
+import base64
+import json
 import os
+from dataclasses import asdict
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from src.qa import Answer, ask_stream
+from src.qa import Answer, Retrieved, ask_stream
 
 load_dotenv()
 ROOT = Path(__file__).resolve().parent
+SESSION_FILE = ROOT / "chat_session.json"
+
 
 st.set_page_config(
     page_title="Lemons Virtual Inspector",
@@ -41,6 +46,53 @@ if not (ROOT / "chroma_db").exists():
         "Vector index not found. Run `uv run python -m src.ingest && uv run python -m src.index` first."
     )
     st.stop()
+
+
+def _save_session(messages: list[dict]) -> None:
+    """Serialize and save current chat session to disk."""
+    serialized = []
+    for msg in messages:
+        m = msg.copy()
+        if m["role"] == "user" and m.get("image_bytes"):
+            m["image_b64"] = base64.b64encode(m.pop("image_bytes")).decode("ascii")
+        elif m["role"] == "user":
+            m.pop("image_bytes", None)
+            m["image_b64"] = None
+        if m["role"] == "assistant" and m.get("answer"):
+            m["answer"] = asdict(m["answer"])
+        serialized.append(m)
+    SESSION_FILE.write_text(json.dumps(serialized, indent=2))
+
+
+def _load_session() -> list[dict]:
+    """Load and deserialize chat session from disk."""
+    if not SESSION_FILE.exists():
+        return []
+    try:
+        messages = json.loads(SESSION_FILE.read_text())
+        deserialized = []
+        for msg in messages:
+            m = msg.copy()
+            if m["role"] == "user":
+                if m.get("image_b64"):
+                    m["image_bytes"] = base64.b64decode(m.pop("image_b64"))
+                else:
+                    m.pop("image_b64", None)
+                    m["image_bytes"] = None
+            if m["role"] == "assistant" and m.get("answer"):
+                a = m["answer"]
+                sources = [Retrieved(**r) for r in a["sources"]]
+                m["answer"] = Answer(
+                    text=a["text"],
+                    sources=sources,
+                    cited_rules=a["cited_rules"],
+                    invalid_citations=a["invalid_citations"],
+                    retrieved_images=a["retrieved_images"],
+                )
+            deserialized.append(m)
+        return deserialized
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return []
 
 
 def _render_extras(a: Answer) -> None:
@@ -99,9 +151,10 @@ def _render_extras(a: Answer) -> None:
             st.divider()
 
 
+
 # --- chat state ---
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = _load_session()
 
 # replay history
 for msg in st.session_state.messages:
@@ -138,9 +191,21 @@ if prompt and prompt.text:
         with st.spinner("Consulting the rulebook…"):
             text_so_far = ""
             final: Answer | None = None
+
+            prior_messages = [
+                {
+                    "role": msg["role"],
+                    "content": msg["content"],
+                }
+                for msg in st.session_state.messages[:-1]
+            ]
+           
             try:
                 for item in ask_stream(
-                    q, image_bytes=image_bytes, image_mime=image_mime
+                    q,
+                    image_bytes=image_bytes,
+                    image_mime=image_mime,
+                    conversation_history=prior_messages,
                 ):
                     if isinstance(item, str):
                         text_so_far += item
@@ -157,6 +222,7 @@ if prompt and prompt.text:
     st.session_state.messages.append(
         {"role": "assistant", "content": text_so_far, "answer": final}
     )
+    _save_session(st.session_state.messages)
     st.rerun()
 
 # sidebar
@@ -182,6 +248,8 @@ with st.sidebar:
     ]:
         st.markdown(f"- {ex}")
 
+    st.divider()
     if st.button("Clear chat"):
+        SESSION_FILE.unlink(missing_ok=True)
         st.session_state.messages = []
         st.rerun()

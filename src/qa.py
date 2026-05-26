@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from src.index import (
     CHROMA_DIR,
     COLLECTION_NAME,
+    FORUM_COLLECTION_NAME,
     IMAGES_COLLECTION,
     MODEL_NAME,
     embed_query,
@@ -37,6 +38,8 @@ TOP_K = 6
 MAX_TOKENS = 700
 IMAGE_TOP_K = 4
 IMAGE_SIM_THRESHOLD = 0.55  # cosine distance; lower = more similar
+FORUM_TOP_K = 3
+FORUM_SIM_THRESHOLD = 0.55
 
 SYSTEM_PROMPT = """\
 You are the Lemons Virtual Inspector, helping racing teams understand the
@@ -61,17 +64,29 @@ RULES FOR YOUR ANSWER:
    into your answer ("the cage in your photo shows..."). Combine those visual
    observations with rule citations exactly as you would for a text-only
    question. If the photo seems unrelated to Lemons rules, say so plainly.
-6. When referencing images, include a brief description of what the image shows
+7. When referencing images, include a brief description of what the image shows
    and where it is located (e.g., "Image from Safety Checklist p.3").
-7. If the questions asks for an image or diagram, include a description of what
+8. If the questions asks for an image or diagram, include a description of what
    the image should show and where it is located (e.g., "Image from Safety Checklist p.3").
+9. Pay attention to previous messages in this conversation. If the user refers to
+   something mentioned earlier (e.g., "that price" or "the transmission"), use the
+   conversation context to understand what they're asking about.
+10. The "Community forum threads" section, when present, is informal user
+    discussion, NOT authoritative. Use it only for plain-English framing or to
+    surface common pitfalls. Never present forum content as a rule. If you
+    reference a forum thread, write `(Forum: <title>)` — never `(Rule ...)`
+    for forum content.
+11. When an authoritative rule and a forum thread disagree, follow the rule.
+
 """
 
-# Captures all citation formats: Rule X.Y(.Z), Safety Checklist p.N, How Not To Fail Tech p.N, Tech Sheet
+# Captures all citation formats: Rule X.Y(.Z), Safety Checklist p.N,
+# How Not To Fail Tech p.N, Tech Sheet, and Forum: <title>.
 RULE_CITATION_RE = re.compile(
     r"(?:Rule\s+(\d+(?:\.\d+){1,3})|"
     r"(Safety Checklist|How Not To Fail Tech|Tech Sheet)\s+p\.(\d+)|"
-    r"(Tech Sheet))"
+    r"(Tech Sheet)|"
+    r"Forum:\s*([^)]+))"
 )
 
 
@@ -94,10 +109,10 @@ class Answer:
     invalid_citations: list[str] = field(default_factory=list)
     retrieved_images: list[dict] = field(default_factory=list)
 
-
 # ---- module-level caches so Streamlit reruns don't reload everything ----
 _collection: "chromadb.Collection | None" = None
 _image_collection: "chromadb.Collection | None" = None
+_forum_collection: "chromadb.Collection | None" = None
 _valid_rule_numbers: set[str] = set()
 
 
@@ -124,6 +139,18 @@ def _image_resources():
         except Exception:
             _image_collection = None
     return _image_collection
+
+
+def _forum_resources():
+    """Lazy-load the forum Q&A collection; returns None if not built (degrades gracefully)."""
+    global _forum_collection
+    if _forum_collection is None:
+        try:
+            client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+            _forum_collection = client.get_collection(FORUM_COLLECTION_NAME)
+        except Exception:
+            _forum_collection = None
+    return _forum_collection
 
 
 def retrieve_images(
@@ -158,10 +185,19 @@ def retrieve_images(
     return out
 
 
-def retrieve(question: str, k: int = TOP_K) -> list[Retrieved]:
-    """Single-stage dense retrieval with voyage-3-large query embedding."""
+def retrieve(
+    question: str,
+    k: int = TOP_K,
+    query_embedding: list[float] | None = None,
+) -> list[Retrieved]:
+    """Single-stage dense retrieval with voyage-3-large query embedding.
+
+    Pass `query_embedding` to reuse a vector you already computed (e.g. so a
+    single question doesn't burn two Voyage calls when both the rules and
+    forum collections are queried).
+    """
     coll, _ = _resources()
-    qv = [embed_query(question)]
+    qv = [query_embedding if query_embedding is not None else embed_query(question)]
     res = coll.query(query_embeddings=qv, n_results=k)
     out: list[Retrieved] = []
     for meta, doc, dist in zip(
@@ -181,17 +217,64 @@ def retrieve(question: str, k: int = TOP_K) -> list[Retrieved]:
     return out
 
 
-def _build_user_prompt(question: str, retrieved: list[Retrieved]) -> str:
-    """Format the user's question and retrieved rules into a prompt for Claude."""
-    parts = ["Relevant rules (cite these by their bracketed tag):\n"]
+def retrieve_forum(
+    question: str,
+    k: int = FORUM_TOP_K,
+    query_embedding: list[float] | None = None,
+) -> list[Retrieved]:
+    """Dense retrieval over the forum Q&A collection (returns [] if collection missing).
+
+    Pass `query_embedding` to skip the Voyage call — the rules retriever has
+    likely already computed the same vector for this question.
+    """
+    coll = _forum_resources()
+    if coll is None:
+        return []
+    qv = [query_embedding if query_embedding is not None else embed_query(question)]
+    res = coll.query(query_embeddings=qv, n_results=k)
+    out: list[Retrieved] = []
+    for meta, doc, dist in zip(
+        res["metadatas"][0], res["documents"][0], res["distances"][0]
+    ):
+        if dist > FORUM_SIM_THRESHOLD:
+            continue
+        title = (meta.get("title") or "")[:50]
+        out.append(
+            Retrieved(
+                citation=f"Forum: {title}",
+                text=doc,
+                rule_number=None,
+                image_paths=[],
+                page=0,
+                doc=meta.get("doc", "Forum"),
+                distance=float(dist),
+            )
+        )
+    return out
+
+
+def _build_user_prompt(
+    question: str,
+    retrieved: list[Retrieved],
+    forum: list[Retrieved] | None = None,
+) -> str:
+    """Format the question with authoritative rules and (optionally) community forum context."""
+    parts = ["Authoritative rules (cite these by their bracketed tag):\n"]
     for r in retrieved:
         parts.append(f"[{r.citation}]\n{r.text}\n")
+    if forum:
+        parts.append(
+            "\nCommunity forum threads (informal explanations — use for plain-English "
+            "framing only, do NOT cite as a rule):\n"
+        )
+        for r in forum:
+            parts.append(f"[{r.citation}]\n{r.text}\n")
     parts.append(f"\nQuestion: {question}")
     return "\n".join(parts)
 
 
 def _validate(answer_text: str, valid: set[str]) -> tuple[list[str], list[str]]:
-    """Extract all citations (Rule X.Y, Safety Checklist p.N, etc.) and validate against corpus."""
+    """Extract all citations (Rule X.Y, Safety Checklist p.N, Forum: ..., etc.) and validate against corpus."""
     matches = RULE_CITATION_RE.findall(answer_text)
     cited = []
     invalid = []
@@ -205,12 +288,17 @@ def _validate(answer_text: str, valid: set[str]) -> tuple[list[str], list[str]]:
             citation = f"{match[1]} p.{match[2]}"
         elif match[3]:  # Tech Sheet
             citation = "Tech Sheet"
+        elif match[4]:  # Forum: <title>
+            title = match[4].strip()
+            citation = f"Forum: {title}"
         else:
             continue
         if citation not in cited:
             cited.append(citation)
 
     return cited, invalid
+
+
 
 
 def _build_user_content(user_prompt: str, image_bytes: bytes | None, image_mime: str):
@@ -233,27 +321,38 @@ def ask(
     image_bytes: bytes | None = None,
     image_mime: str = "image/jpeg",
     k: int = TOP_K,
+    conversation_history: list[dict] | None = None
 ) -> Answer:
     """Retrieve rules, generate an answer with Claude, validate citations, and surface related images."""
     _, valid = _resources()
-    retrieved = retrieve(question, k=k)
-    user_prompt = _build_user_prompt(question, retrieved)
+    qv = embed_query(question)
+    retrieved = retrieve(question, k=k, query_embedding=qv)
+    forum = retrieve_forum(question, query_embedding=qv)
+    user_prompt = _build_user_prompt(question, retrieved, forum)
     content = _build_user_content(user_prompt, image_bytes, image_mime)
 
     client = Anthropic()
+
+    #building the messages previous and curr
+    messages = conversation_history or []
+    messages = [m.copy() for m in messages]
+    messages.append({"role":"user", "content": content})
+
+
     msg = client.messages.create(
         model=ANTHROPIC_MODEL,
         max_tokens=MAX_TOKENS,
         temperature=0,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content}],
+        #messages=[{"role": "user", "content": content}],
+        messages=messages
     )
     text = "".join(block.text for block in msg.content if block.type == "text")
     cited, invalid = _validate(text, valid)
     images = retrieve_images(question, image_bytes=image_bytes)
     return Answer(
         text=text,
-        sources=retrieved,
+        sources=retrieved + forum,
         cited_rules=cited,
         invalid_citations=invalid,
         retrieved_images=images,
@@ -265,21 +364,28 @@ def ask_stream(
     image_bytes: bytes | None = None,
     image_mime: str = "image/jpeg",
     k: int = TOP_K,
+    conversation_history: list[dict] | None = None,
 ) -> Iterator[str | Answer]:
     """Yields str deltas as Claude streams, then yields a final Answer object."""
     _, valid = _resources()
-    retrieved = retrieve(question, k=k)
-    user_prompt = _build_user_prompt(question, retrieved)
+    qv = embed_query(question)
+    retrieved = retrieve(question, k=k, query_embedding=qv)
+    forum = retrieve_forum(question, query_embedding=qv)
+    user_prompt = _build_user_prompt(question, retrieved, forum)
     content = _build_user_content(user_prompt, image_bytes, image_mime)
 
     client = Anthropic()
     full = ""
+
+    messages = [m.copy() for m in (conversation_history or [])]
+    messages.append({"role": "user", "content": content})
+
     with client.messages.stream(
         model=ANTHROPIC_MODEL,
         max_tokens=MAX_TOKENS,
         temperature=0,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content}],
+        messages=messages,
     ) as stream:
         for delta in stream.text_stream:
             full += delta
@@ -288,7 +394,7 @@ def ask_stream(
     images = retrieve_images(question, image_bytes=image_bytes)
     yield Answer(
         text=full,
-        sources=retrieved,
+        sources=retrieved + forum,
         cited_rules=cited,
         invalid_citations=invalid,
         retrieved_images=images,

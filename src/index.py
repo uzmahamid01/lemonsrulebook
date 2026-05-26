@@ -25,6 +25,7 @@ IMAGES_FILE = ROOT / "images.json"
 CHROMA_DIR = ROOT / "chroma_db"
 COLLECTION_NAME = "lemons"
 IMAGES_COLLECTION = "lemons_images"
+FORUM_COLLECTION_NAME = "lemons_forum"
 MODEL_NAME = "voyage-4-large"            # text-only chunks
 IMAGE_MODEL_NAME = "voyage-multimodal-3"  # embeds actual image content (+ optional text companion)
 
